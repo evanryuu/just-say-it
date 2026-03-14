@@ -5,7 +5,6 @@ export interface AudioQueueCallbacks {
 }
 
 interface QueueEntry {
-  index: number;
   audioPromise: Promise<HTMLAudioElement | null>;
   abortController: AbortController;
 }
@@ -28,12 +27,10 @@ export class AudioQueue {
   enqueueSentence(text: string): void {
     if (this.stopped) return;
 
-    const index = this.queue.length;
     const abortController = new AbortController();
-
-    // Fetch TTS and pre-create a ready-to-play Audio element
+    // Fetch + prepare starts immediately (parallel with other fetches)
     const audioPromise = this.fetchAndPrepare(text, abortController.signal);
-    this.queue.push({ index, audioPromise, abortController });
+    this.queue.push({ audioPromise, abortController });
 
     if (!this.playing) {
       this.playing = true;
@@ -45,14 +42,15 @@ export class AudioQueue {
     this.stopped = true;
     this.playing = false;
 
-    // Cancel all pending fetches
     for (const entry of this.queue) {
       entry.abortController.abort();
     }
 
-    // Stop current audio
     if (this.currentAudio) {
       this.currentAudio.pause();
+      if (this.currentAudio.src.startsWith('blob:')) {
+        URL.revokeObjectURL(this.currentAudio.src);
+      }
       this.currentAudio.removeAttribute('src');
       this.currentAudio = null;
     }
@@ -66,9 +64,6 @@ export class AudioQueue {
     return this.playing && !this.stopped;
   }
 
-  /**
-   * Fetch TTS audio and return a pre-loaded HTMLAudioElement ready to play instantly.
-   */
   private async fetchAndPrepare(
     text: string,
     signal: AbortSignal
@@ -84,32 +79,16 @@ export class AudioQueue {
       if (!res.ok) return null;
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
-      const audio = new Audio();
-      audio.preload = 'auto';
-      audio.src = url;
+      const audio = new Audio(url);
 
-      // Wait until the browser has enough data to start playing
-      await new Promise<void>((resolve, reject) => {
-        const onReady = () => {
-          cleanup();
-          resolve();
-        };
-        const onError = () => {
-          cleanup();
-          URL.revokeObjectURL(url);
-          reject(new Error('Audio preload failed'));
-        };
-        const cleanup = () => {
-          audio.removeEventListener('canplaythrough', onReady);
-          audio.removeEventListener('error', onError);
-        };
-        // If already ready
-        if (audio.readyState >= 4) {
+      // Wait only for 'canplay' (enough data to start), not 'canplaythrough' (full decode)
+      await new Promise<void>((resolve) => {
+        if (audio.readyState >= 3) {
           resolve();
           return;
         }
-        audio.addEventListener('canplaythrough', onReady, { once: true });
-        audio.addEventListener('error', onError, { once: true });
+        audio.addEventListener('canplay', () => resolve(), { once: true });
+        audio.addEventListener('error', () => resolve(), { once: true });
         audio.load();
       });
 
@@ -149,19 +128,8 @@ export class AudioQueue {
 
     try {
       await new Promise<void>((resolve, reject) => {
-        audio.onended = () => {
-          // Clean up blob URL
-          if (audio.src.startsWith('blob:')) {
-            URL.revokeObjectURL(audio.src);
-          }
-          resolve();
-        };
-        audio.onerror = () => {
-          if (audio.src.startsWith('blob:')) {
-            URL.revokeObjectURL(audio.src);
-          }
-          reject(new Error('Audio playback error'));
-        };
+        audio.onended = () => resolve();
+        audio.onerror = () => reject(new Error('Audio playback error'));
         audio.play().catch(reject);
       });
     } catch (err) {
@@ -170,6 +138,10 @@ export class AudioQueue {
       );
     }
 
+    // Clean up blob URL
+    if (audio.src.startsWith('blob:')) {
+      URL.revokeObjectURL(audio.src);
+    }
     this.currentAudio = null;
 
     if (this.stopped) return;

@@ -18,28 +18,29 @@ export async function POST(req: NextRequest) {
 
     const selectedVoice = voice || getVoiceForLang(lang);
     const communicate = new Communicate(text, { voice: selectedVoice });
-    const audioChunks: Buffer[] = [];
 
-    for await (const chunk of communicate.stream()) {
-      if (chunk.type === 'audio' && chunk.data) {
-        audioChunks.push(Buffer.from(chunk.data));
-      }
-    }
+    // Stream audio chunks as they arrive instead of buffering everything
+    const readable = new ReadableStream({
+      async start(controller) {
+        try {
+          for await (const chunk of communicate.stream()) {
+            if (chunk.type === 'audio' && chunk.data) {
+              controller.enqueue(new Uint8Array(chunk.data));
+            }
+          }
+        } catch (err) {
+          controller.error(err);
+          return;
+        }
+        controller.close();
+      },
+    });
 
-    if (audioChunks.length === 0) {
-      return NextResponse.json(
-        { error: 'TTS produced no audio' },
-        { status: 500 }
-      );
-    }
-
-    const audioBuffer = Buffer.concat(audioChunks);
-
-    return new Response(audioBuffer, {
+    return new Response(readable, {
       headers: {
         'Content-Type': 'audio/mpeg',
-        'Content-Length': String(audioBuffer.byteLength),
-        'Cache-Control': 'public, max-age=86400',
+        'Transfer-Encoding': 'chunked',
+        'Cache-Control': 'no-cache',
       },
     });
   } catch (error: unknown) {
