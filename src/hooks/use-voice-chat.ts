@@ -1,6 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { SentenceBuffer } from '@/lib/sentence-buffer';
+import { AudioQueue } from '@/lib/audio-queue';
 
 export type ChatState = 'idle' | 'listening' | 'thinking' | 'speaking';
 
@@ -57,9 +59,10 @@ export function useVoiceChat() {
   const stateRef = useRef<ChatState>('idle');
   const messagesRef = useRef<Message[]>([]);
   const isStoppingRef = useRef(false);
-  const isSpeakingRef = useRef(false);
+  const audioQueueRef = useRef<AudioQueue | null>(null);
   const speakingStartedAtRef = useRef(0);
   const loudFramesRef = useRef(0);
+  const chatAbortRef = useRef<AbortController | null>(null);
 
   // Keep refs in sync
   useEffect(() => {
@@ -100,9 +103,10 @@ export function useVoiceChat() {
       const normalized = Math.min(rms * 8, 1);
       setVolume(normalized);
 
-      // Barge-in: interrupt AI speaking if user speaks
+      // Barge-in: interrupt AI speaking if user speaks loudly enough
       if (
-        isSpeakingRef.current &&
+        stateRef.current === 'speaking' &&
+        audioQueueRef.current?.isPlaying &&
         Date.now() - speakingStartedAtRef.current > BARGE_IN_GRACE_MS
       ) {
         if (normalized > INTERRUPT_VOLUME_THRESHOLD) {
@@ -112,9 +116,13 @@ export function useVoiceChat() {
         }
 
         if (loudFramesRef.current >= BARGE_IN_REQUIRED_FRAMES) {
-          window.speechSynthesis.cancel();
-          isSpeakingRef.current = false;
+          // Stop audio playback
+          audioQueueRef.current?.stopAll();
+          // Cancel in-flight chat request
+          chatAbortRef.current?.abort();
+          chatAbortRef.current = null;
           loudFramesRef.current = 0;
+          setState('listening');
         }
       }
 
@@ -136,89 +144,36 @@ export function useVoiceChat() {
     }
   }, []);
 
-  const speakText = useCallback((text: string): Promise<void> => {
-    return new Promise((resolve) => {
-      if (!text.trim()) {
-        resolve();
-        return;
-      }
-
-      window.speechSynthesis.cancel();
-      const utter = new SpeechSynthesisUtterance(text);
-      utter.rate = 1.1;
-      utter.volume = 1;
-      utter.lang = navigator.language || 'zh-CN';
-
-      // Pick a voice matching the user's language
-      const voices = window.speechSynthesis.getVoices();
-      const lang = navigator.language || 'zh-CN';
-      const match = voices.find((v) => v.lang.startsWith(lang.slice(0, 2)));
-      if (match) utter.voice = match;
-
-      isSpeakingRef.current = true;
-      loudFramesRef.current = 0;
-      speakingStartedAtRef.current = 0;
-      let hasStarted = false;
-      const startTimer = window.setTimeout(() => {
-        if (!hasStarted) {
-          setErrorMessage(
-            'Audio playback did not start. Check system output volume and browser autoplay/sound settings.'
-          );
-        }
-      }, 2000);
-      const safetyTimer = window.setTimeout(() => {
-        // Some browsers occasionally fail to emit onend/onerror.
-        window.clearTimeout(startTimer);
-        isSpeakingRef.current = false;
-        loudFramesRef.current = 0;
-        resolve();
-      }, 15000);
-      utter.onstart = () => {
-        hasStarted = true;
-        speakingStartedAtRef.current = Date.now();
-        window.clearTimeout(startTimer);
-      };
-      utter.onend = () => {
-        window.clearTimeout(startTimer);
-        window.clearTimeout(safetyTimer);
-        isSpeakingRef.current = false;
-        loudFramesRef.current = 0;
-        resolve();
-      };
-      utter.onerror = () => {
-        window.clearTimeout(startTimer);
-        window.clearTimeout(safetyTimer);
-        isSpeakingRef.current = false;
-        loudFramesRef.current = 0;
-        setErrorMessage(
-          'Audio playback failed. Try changing the browser/system voice and retry.'
-        );
-        resolve();
-      };
-      window.speechSynthesis.speak(utter);
-    });
-  }, []);
-
   // Forward declaration ref so processTranscript can call startListeningInternal
   const startListeningInternalRef = useRef<() => void>(() => {});
 
   const processTranscript = useCallback(
     async (text: string) => {
-      stopRecognition();
+      // Don't stop recognition — keep it active for barge-in
       setInterimText('');
       setErrorMessage('');
       setState('thinking');
+
+      // Cancel any previous in-flight chat request
+      chatAbortRef.current?.abort();
+
+      // Stop any ongoing audio playback
+      audioQueueRef.current?.stopAll();
 
       const userMsg: Message = { role: 'user', content: text };
       const updated = [...messagesRef.current, userMsg];
       setMessages(updated);
       messagesRef.current = updated;
 
+      const abortController = new AbortController();
+      chatAbortRef.current = abortController;
+
       try {
         const res = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ messages: updated }),
+          signal: abortController.signal,
         });
 
         if (!res.ok) {
@@ -237,15 +192,51 @@ export function useVoiceChat() {
           throw new Error(normalizeApiErrorMessage(serverMessage, res.status));
         }
 
-        setState('speaking');
+        // Set up audio queue for this response
+        const lang = navigator.language || 'zh-CN';
+        const audioQueue = new AudioQueue(
+          {
+            onPlaybackStart: () => {
+              speakingStartedAtRef.current = Date.now();
+              loudFramesRef.current = 0;
+              if (!isStoppingRef.current) {
+                setState('speaking');
+              }
+            },
+            onPlaybackEnd: () => {
+              loudFramesRef.current = 0;
+              if (!isStoppingRef.current) {
+                setState('listening');
+              }
+            },
+            onError: (err) => {
+              console.error('Audio playback error:', err);
+            },
+          },
+          lang
+        );
+        audioQueueRef.current = audioQueue;
+
+        // Add a placeholder assistant message and update it incrementally
+        const assistantMsg: Message = { role: 'assistant', content: '' };
+        setMessages((prev) => [...prev, assistantMsg]);
+        messagesRef.current = [...messagesRef.current, assistantMsg];
+
+        // Set up sentence buffer
+        let fullText = '';
+        const sentenceBuffer = new SentenceBuffer((sentence) => {
+          audioQueue.enqueueSentence(sentence);
+        });
 
         const reader = res.body!.getReader();
         const decoder = new TextDecoder();
-        let fullText = '';
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+
+          if (abortController.signal.aborted) break;
+
           const chunk = decoder.decode(value, { stream: true });
           for (const line of chunk.split('\n')) {
             if (line.startsWith('data: ')) {
@@ -254,41 +245,52 @@ export function useVoiceChat() {
               try {
                 const { text: t } = JSON.parse(payload);
                 fullText += t;
+                sentenceBuffer.feed(t);
+                // Update the last (assistant) message in-place
+                setMessages((prev) => {
+                  const updated = [...prev];
+                  updated[updated.length - 1] = { role: 'assistant', content: fullText };
+                  return updated;
+                });
               } catch {}
             }
           }
         }
 
-        const assistantMsg: Message = {
-          role: 'assistant',
-          content: fullText,
-        };
-        setMessages((prev) => [...prev, assistantMsg]);
-        messagesRef.current = [...messagesRef.current, assistantMsg];
+        // Flush remaining text in buffer
+        sentenceBuffer.flush();
+
+        // Final sync of messagesRef
+        messagesRef.current = [...messagesRef.current.slice(0, -1), { role: 'assistant', content: fullText }];
 
         if (!fullText.trim()) {
           setErrorMessage('Assistant returned an empty response. Please try again.');
-        }
-        await speakText(fullText);
-
-        if (!isStoppingRef.current) {
-          startListeningInternalRef.current();
+          if (!isStoppingRef.current) {
+            setState('listening');
+          }
         }
       } catch (e) {
+        if (e instanceof DOMException && e.name === 'AbortError') {
+          // Barge-in aborted the request — this is expected
+          return;
+        }
         console.error('Chat error:', e);
         const message =
           e instanceof Error ? e.message : 'Unknown error while calling /api/chat';
         setErrorMessage(message);
         if (!isStoppingRef.current) {
-          startListeningInternalRef.current();
+          setState('listening');
         }
       }
     },
-    [stopRecognition, speakText]
+    [stopRecognition]
   );
 
   const startListeningInternal = useCallback(() => {
     if (isStoppingRef.current) return;
+
+    // Don't create a new recognition if one already exists
+    if (recognitionRef.current) return;
 
     const SpeechRec =
       window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -300,41 +302,70 @@ export function useVoiceChat() {
     }
 
     const rec = new SpeechRec();
-    rec.continuous = false;
+    rec.continuous = true;
     rec.interimResults = true;
     rec.lang = navigator.language || 'zh-CN';
 
     rec.onstart = () => {
-      if (!isStoppingRef.current) setState('listening');
+      if (!isStoppingRef.current && stateRef.current !== 'thinking' && stateRef.current !== 'speaking') {
+        setState('listening');
+      }
     };
 
     rec.onresult = (e: SpeechRecognitionEvent) => {
       let interim = '';
-      let final = '';
+      let finalText = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) final += t;
+        if (e.results[i].isFinal) finalText += t;
         else interim += t;
       }
-      setInterimText(final || interim);
-      if (final) processTranscript(final);
+      setInterimText(finalText || interim);
+
+      if (finalText) {
+        if (stateRef.current === 'speaking') {
+          // Barge-in via speech: stop audio and process new input
+          audioQueueRef.current?.stopAll();
+          chatAbortRef.current?.abort();
+          chatAbortRef.current = null;
+          loudFramesRef.current = 0;
+        }
+        // Stop current recognition before processing (will restart after)
+        stopRecognition();
+        processTranscript(finalText);
+        // Restart recognition for next input
+        setTimeout(() => {
+          if (!isStoppingRef.current) {
+            startListeningInternalRef.current();
+          }
+        }, 100);
+      }
     };
 
     rec.onerror = (e: SpeechRecognitionErrorEvent) => {
-      if (e.error === 'no-speech' && !isStoppingRef.current) {
-        startListeningInternalRef.current();
+      if (e.error === 'no-speech' || e.error === 'aborted') {
+        // Expected errors, just restart if appropriate
+        recognitionRef.current = null;
+        if (!isStoppingRef.current) {
+          setTimeout(() => startListeningInternalRef.current(), 100);
+        }
+        return;
       }
+      console.error('Speech recognition error:', e.error);
+      recognitionRef.current = null;
     };
 
     rec.onend = () => {
-      if (stateRef.current === 'listening' && !isStoppingRef.current) {
-        startListeningInternalRef.current();
+      recognitionRef.current = null;
+      // Restart recognition if we're in a state that needs it
+      if (!isStoppingRef.current && (stateRef.current === 'listening' || stateRef.current === 'speaking')) {
+        setTimeout(() => startListeningInternalRef.current(), 100);
       }
     };
 
     rec.start();
     recognitionRef.current = rec;
-  }, [processTranscript]);
+  }, [processTranscript, stopRecognition]);
 
   // Keep the ref updated
   useEffect(() => {
@@ -371,8 +402,12 @@ export function useVoiceChat() {
   const stopChat = useCallback(() => {
     isStoppingRef.current = true;
     stopRecognition();
-    window.speechSynthesis.cancel();
-    isSpeakingRef.current = false;
+    // Stop audio queue instead of speechSynthesis
+    audioQueueRef.current?.stopAll();
+    audioQueueRef.current = null;
+    // Cancel in-flight chat request
+    chatAbortRef.current?.abort();
+    chatAbortRef.current = null;
     loudFramesRef.current = 0;
     stopVolumeLoop();
     audioContextRef.current?.close();
@@ -389,7 +424,8 @@ export function useVoiceChat() {
     return () => {
       isStoppingRef.current = true;
       stopRecognition();
-      window.speechSynthesis?.cancel();
+      audioQueueRef.current?.stopAll();
+      chatAbortRef.current?.abort();
       cancelAnimationFrame(rafRef.current);
       audioContextRef.current?.close();
       mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
