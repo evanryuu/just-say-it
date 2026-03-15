@@ -11,9 +11,9 @@ export interface Message {
   content: string;
 }
 
-const INTERRUPT_VOLUME_THRESHOLD = 0.12;
-const BARGE_IN_GRACE_MS = 700;
-const BARGE_IN_REQUIRED_FRAMES = 10;
+const INTERRUPT_VOLUME_THRESHOLD = 0.25;
+const BARGE_IN_GRACE_MS = 1500;
+const BARGE_IN_REQUIRED_FRAMES = 20;
 
 function getMicErrorMessage(error: unknown): string {
   const fallback = 'Unable to access microphone.';

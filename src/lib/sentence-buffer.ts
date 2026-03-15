@@ -1,13 +1,14 @@
-// Split on sentence-ending punctuation AND clause boundaries (commas, semicolons, colons)
-// This produces smaller chunks so TTS can start sooner.
+// First chunk uses clause-level splitting for fast time-to-first-audio.
+// Subsequent chunks use sentence-level splitting to reduce total TTS requests.
 const CLAUSE_TERMINATORS = /([.!?。！？\n,;:，；：、])\s*/;
+const SENTENCE_TERMINATORS = /([.!?。！？\n])\s*/;
 
-// Minimum character count before we emit a clause.
-// Prevents overly short TTS requests (e.g. "Hi," alone sounds unnatural).
-const MIN_CHUNK_LENGTH = 8;
+const FIRST_CHUNK_MIN_LENGTH = 8;
+const LATER_CHUNK_MIN_LENGTH = 20;
 
 export class SentenceBuffer {
   private buffer = '';
+  private emittedCount = 0;
   private onSentence: (sentence: string) => void;
 
   constructor(onSentence: (sentence: string) => void) {
@@ -29,18 +30,22 @@ export class SentenceBuffer {
 
   reset(): void {
     this.buffer = '';
+    this.emittedCount = 0;
   }
 
   private drain(): void {
     while (true) {
-      const match = CLAUSE_TERMINATORS.exec(this.buffer);
+      const isFirst = this.emittedCount === 0;
+      const pattern = isFirst ? CLAUSE_TERMINATORS : SENTENCE_TERMINATORS;
+      const minLength = isFirst ? FIRST_CHUNK_MIN_LENGTH : LATER_CHUNK_MIN_LENGTH;
+
+      const match = pattern.exec(this.buffer);
       if (!match) break;
 
       const end = match.index + match[0].length;
       const candidate = this.buffer.slice(0, end).trim();
 
-      // If the chunk is too short, keep buffering
-      if (candidate.length < MIN_CHUNK_LENGTH) {
+      if (candidate.length < minLength) {
         break;
       }
 
@@ -48,6 +53,7 @@ export class SentenceBuffer {
 
       if (candidate) {
         this.onSentence(candidate);
+        this.emittedCount++;
       }
     }
   }
