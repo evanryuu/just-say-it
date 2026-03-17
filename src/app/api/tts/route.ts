@@ -33,7 +33,7 @@ export async function POST(req: NextRequest) {
         audio_params: {
           format: 'mp3',
           sample_rate: 24000,
-          speech_rate: 15,
+          speech_rate: 0,
         },
         // context_texts guides the TTS model's tone/emotion (seed-tts-2.0 only)
         context_texts: ['Please speak in a warm, friendly, and conversational tone.'],
