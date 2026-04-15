@@ -7,41 +7,17 @@
  *   data: {"type":"audio","data":"base64"}  — MP3 audio chunk
  *   data: [DONE]
  *
- * Server-side flow:
- *   1. Stream LLM response via OpenAI SDK (→ ARK)
- *   2. Feed each LLM token into VolcEngine bidirectional WebSocket
- *   3. VolcEngine handles sentence splitting internally
- *   4. Audio chunks stream back and are base64-encoded into the SSE response
+ * TTS provider (Volc or Minimax) is selected via TTS_PROVIDER env var.
  */
 
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
-import { VolcTtsWs, type VolcTtsConfig } from '@/lib/volc-tts-ws';
+import { createTtsProvider, TtsStallError } from '@/lib/tts';
 
 function resolveArkBaseUrl() {
   const raw = process.env.ARK_BASE_URL?.trim();
   const base = raw || 'https://ark.cn-beijing.volces.com/api/v3';
   return base.replace(/\/+$/, '');
-}
-
-function getTtsConfig(): VolcTtsConfig {
-  const appId = process.env.VOLC_TTS_APPID;
-  const accessKey = process.env.VOLC_TTS_ACCESS_TOKEN;
-  if (!appId || !accessKey) {
-    throw new Error('Missing VOLC_TTS_APPID or VOLC_TTS_ACCESS_TOKEN');
-  }
-  return {
-    appId,
-    accessKey,
-    resourceId: process.env.VOLC_TTS_RESOURCE_ID || 'seed-tts-2.0',
-    speaker: process.env.VOLC_TTS_SPEAKER || 'zh_female_cancan_mars_bigtts',
-    format: 'mp3',
-    sampleRate: 24000,
-    speechRate: 0,
-    contextTexts: [
-      'Please speak in a warm, friendly, and conversational tone.',
-    ],
-  };
 }
 
 export async function POST(req: NextRequest) {
@@ -60,9 +36,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    let ttsConfig: VolcTtsConfig;
+    let tts;
     try {
-      ttsConfig = getTtsConfig();
+      tts = createTtsProvider();
     } catch (e) {
       return NextResponse.json(
         { error: e instanceof Error ? e.message : 'TTS config error' },
@@ -86,12 +62,90 @@ export async function POST(req: NextRequest) {
 
     const encoder = new TextEncoder();
 
+    const t0 = Date.now();
+    const lastUser = [...messages].reverse().find((m) => m?.role === 'user');
+    const lastUserText: string =
+      typeof lastUser?.content === 'string' ? lastUser.content : '';
+    const turnId = Math.random().toString(36).slice(2, 10);
+
     const readable = new ReadableStream({
       async start(controller) {
-        const tts = new VolcTtsWs(ttsConfig);
         let ttsSessionActive = false;
         let llmDone = false;
         let closed = false;
+
+        const marks: Record<string, number> = {};
+        const mark = (name: string) => {
+          if (marks[name] === undefined) marks[name] = Date.now() - t0;
+        };
+        const updateMark = (name: string) => {
+          marks[name] = Date.now() - t0;
+        };
+        let audioChunkCount = 0;
+        let audioBytesTotal = 0;
+        let textCharCount = 0;
+        let logged = false;
+        let ttsFailed = false;
+        let ttsFailReason: string | null = null;
+        const logTurn = (outcome: string, extra?: Record<string, unknown>) => {
+          if (logged) return;
+          logged = true;
+          const payload = {
+            evt: 'chat-voice.turn',
+            turnId,
+            outcome,
+            messagesLen: messages.length,
+            userLen: lastUserText.length,
+            userPreview: lastUserText.slice(0, 60),
+            textChars: textCharCount,
+            audioChunks: audioChunkCount,
+            audioBytes: audioBytesTotal,
+            marks,
+            totalMs: Date.now() - t0,
+            ...extra,
+          };
+          console.log(JSON.stringify(payload));
+
+          // Human-readable breakdown: identify the dominant phase so it's
+          // obvious at a glance whether the turn was bottlenecked by LLM,
+          // TTS handshake, TTS synthesis, or plumbing.
+          const total = Date.now() - t0;
+          const llmTtft = marks.t_llm_first_token ?? 0;
+          const ttsHandshake = marks.t_tts_session_started ?? 0;
+          const ttsReady = Math.max(
+            marks.t_tts_session_started ?? 0,
+            marks.t_llm_first_token ?? 0,
+          );
+          const ttsTtfb =
+            marks.t_first_audio !== undefined
+              ? marks.t_first_audio - ttsReady
+              : 0;
+          const ttsStream =
+            marks.t_first_audio !== undefined &&
+            marks.t_last_audio !== undefined
+              ? marks.t_last_audio - marks.t_first_audio
+              : 0;
+
+          type Phase = { name: string; ms: number };
+          const phases: Phase[] = [
+            { name: 'LLM_TTFT', ms: llmTtft },
+            { name: 'TTS_HANDSHAKE', ms: ttsHandshake },
+            { name: 'TTS_SYNTHESIS', ms: ttsTtfb },
+            { name: 'TTS_STREAM', ms: ttsStream },
+          ];
+          const bottleneck = phases.reduce((a, b) => (b.ms > a.ms ? b : a));
+          const pct = (ms: number) =>
+            total > 0 ? `${Math.round((ms / total) * 100)}%` : '—';
+
+          console.log(
+            `[turn ${turnId}] total=${total}ms | ` +
+              `LLM_TTFT=${llmTtft}ms (${pct(llmTtft)}) ` +
+              `TTS_HANDSHAKE=${ttsHandshake}ms (${pct(ttsHandshake)}) ` +
+              `TTS_SYNTHESIS=${ttsTtfb}ms (${pct(ttsTtfb)}) ` +
+              `TTS_STREAM=${ttsStream}ms (${pct(ttsStream)}) ` +
+              `| bottleneck=${bottleneck.name}`,
+          );
+        };
 
         const enqueue = (data: string) => {
           if (closed) return;
@@ -118,43 +172,69 @@ export async function POST(req: NextRequest) {
             controller.close();
           } catch {}
           cleanup();
+          mark('t_done');
+          logTurn(ttsFailed ? 'degraded' : 'ok', {
+            ttsFailReason: ttsFailReason ?? undefined,
+          });
         };
 
         try {
           // 1. Start TTS setup and LLM stream in parallel to reduce time-to-first-token
-          const ttsSetup = tts.connect().then(() =>
-            tts.startSession({
-              onAudio: (chunk) => {
-                enqueue(
-                  JSON.stringify({
-                    type: 'audio',
-                    data: chunk.toString('base64'),
-                  }),
-                );
-              },
-              onFinished: () => {
-                ttsSessionActive = false;
-                finish();
-              },
-              onError: (err) => {
-                console.error('TTS session error:', err);
-                ttsSessionActive = false;
-                if (llmDone) finish();
-              },
-            }),
-          );
+          const ttsSetup = tts
+            .connect()
+            .then(() => {
+              mark('t_tts_connected');
+              return tts.startSession({
+                onAudio: (chunk) => {
+                  mark('t_first_audio');
+                  updateMark('t_last_audio');
+                  audioChunkCount += 1;
+                  audioBytesTotal += chunk.length;
+                  enqueue(
+                    JSON.stringify({
+                      type: 'audio',
+                      data: chunk.toString('base64'),
+                    }),
+                  );
+                },
+                onFinished: () => {
+                  mark('t_session_finished');
+                  ttsSessionActive = false;
+                  finish();
+                },
+                onError: (err) => {
+                  console.error('TTS session error:', err);
+                  ttsSessionActive = false;
+                  flagTtsFailure(err);
+                  if (llmDone) finish();
+                },
+              });
+            })
+            .then(() => {
+              mark('t_tts_session_started');
+            });
 
           // Track TTS readiness via flag (set by resolved promise callback)
           let ttsReady = false;
-          let ttsFailed = false;
+          const flagTtsFailure = (err: unknown) => {
+            if (ttsFailed) return;
+            ttsFailed = true;
+            ttsFailReason =
+              err instanceof TtsStallError
+                ? 'tts_stall'
+                : err instanceof Error
+                  ? err.message
+                  : 'tts_error';
+            enqueue(
+              JSON.stringify({ type: 'error', reason: ttsFailReason }),
+            );
+          };
           ttsSetup
             .then(() => {
               ttsSessionActive = true;
               ttsReady = true;
             })
-            .catch(() => {
-              ttsFailed = true;
-            });
+            .catch(flagTtsFailure);
 
           const stream = await client.chat.completions.create({
             model: process.env.ARK_MODEL_ID!,
@@ -177,6 +257,8 @@ export async function POST(req: NextRequest) {
             if (closed) break;
             const text = chunk.choices[0]?.delta?.content ?? '';
             if (text) {
+              mark('t_llm_first_token');
+              textCharCount += text.length;
               enqueue(JSON.stringify({ type: 'text', delta: text }));
               if (ttsReady && ttsSessionActive) {
                 // TTS is ready — also flush any buffered tokens first
@@ -192,6 +274,7 @@ export async function POST(req: NextRequest) {
           }
 
           llmDone = true;
+          mark('t_llm_done');
 
           // 3. If TTS wasn't ready during streaming, wait for it now
           if (!ttsReady && !ttsFailed) {
@@ -232,6 +315,10 @@ export async function POST(req: NextRequest) {
             } catch {}
           }
           cleanup();
+          mark('t_done');
+          logTurn('error', {
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
       },
     });

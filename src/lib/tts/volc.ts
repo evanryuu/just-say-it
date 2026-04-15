@@ -15,10 +15,20 @@
 import WebSocket from 'ws';
 import { randomUUID } from 'crypto';
 import { gunzipSync } from 'zlib';
+import {
+  TtsStallError,
+  type TtsCapabilities,
+  type TtsProvider,
+  type TtsSessionCallbacks,
+} from './types';
 
 // === Constants ===
 
 const WS_URL = 'wss://openspeech.bytedance.com/api/v3/tts/bidirection';
+
+const CONNECT_TIMEOUT_MS = 3000;
+const START_SESSION_TIMEOUT_MS = 3000;
+const AUDIO_STALL_TIMEOUT_MS = 8000;
 
 /** Event codes for the binary protocol */
 const EVT = {
@@ -169,31 +179,43 @@ function parseFrame(data: Buffer): ParsedFrame {
   return { msgType, event, payload };
 }
 
-// === Public types ===
+// === Client ===
 
-export interface VolcTtsConfig {
+interface VolcTtsConfig {
   appId: string;
   accessKey: string;
-  resourceId?: string;
-  speaker?: string;
-  format?: 'mp3' | 'ogg_opus' | 'pcm';
-  sampleRate?: number;
-  speechRate?: number;
+  resourceId: string;
+  speaker: string;
+  sampleRate: number;
+  speechRate: number;
   contextTexts?: string[];
 }
 
-export interface TtsSessionCallbacks {
-  /** Called with raw audio bytes (MP3 by default) as they arrive. */
-  onAudio: (chunk: Buffer) => void;
-  /** Called when the session finishes (all audio has been sent). */
-  onFinished: () => void;
-  /** Called on any error during the session. */
-  onError: (error: Error) => void;
+function readVolcConfig(): VolcTtsConfig {
+  const appId = process.env.VOLC_TTS_APPID;
+  const accessKey = process.env.VOLC_TTS_ACCESS_TOKEN;
+  if (!appId || !accessKey) {
+    throw new Error('Missing VOLC_TTS_APPID or VOLC_TTS_ACCESS_TOKEN');
+  }
+  return {
+    appId,
+    accessKey,
+    resourceId: process.env.VOLC_TTS_RESOURCE_ID || 'seed-tts-2.0',
+    speaker: process.env.VOLC_TTS_SPEAKER || 'zh_female_cancan_mars_bigtts',
+    sampleRate: 24000,
+    speechRate: Number(process.env.VOLC_TTS_SPEECH_RATE) || 0,
+    contextTexts: ['Please speak in a warm, friendly, and conversational tone.'],
+  };
 }
 
-// === Client ===
+export class VolcTtsProvider implements TtsProvider {
+  readonly capabilities: TtsCapabilities = {
+    audioFormat: 'mp3',
+    sampleRate: 24000,
+    supportsCancel: true,
+    supportsParalinguistic: false,
+  };
 
-export class VolcTtsWs {
   private ws: WebSocket | null = null;
   private config: VolcTtsConfig;
   private sessionId: string | null = null;
@@ -205,9 +227,13 @@ export class VolcTtsWs {
     reject: (err: Error) => void;
     successEvent: number;
     failEvents: number[];
+    timer?: NodeJS.Timeout;
   } | null = null;
 
-  constructor(config: VolcTtsConfig) {
+  /** Watchdog that fires TtsStallError if no audio/finish arrives in time */
+  private stallTimer: NodeJS.Timeout | null = null;
+
+  constructor(config: VolcTtsConfig = readVolcConfig()) {
     this.config = config;
   }
 
@@ -221,7 +247,7 @@ export class VolcTtsWs {
         headers: {
           'X-Api-App-Key': this.config.appId,
           'X-Api-Access-Key': this.config.accessKey,
-          'X-Api-Resource-Id': this.config.resourceId || 'seed-tts-2.0',
+          'X-Api-Resource-Id': this.config.resourceId,
           'X-Api-Connect-Id': randomUUID(),
         },
       });
@@ -229,12 +255,28 @@ export class VolcTtsWs {
       ws.binaryType = 'nodebuffer';
       this.ws = ws;
 
+      const timer = setTimeout(() => {
+        if (this.resolver) {
+          const r = this.resolver;
+          this.resolver = null;
+          r.reject(
+            new TtsStallError(
+              `VolcEngine connect timed out after ${CONNECT_TIMEOUT_MS}ms`,
+            ),
+          );
+          try {
+            ws.close();
+          } catch {}
+        }
+      }, CONNECT_TIMEOUT_MS);
+
       ws.on('open', () => {
         this.resolver = {
           resolve,
           reject,
           successEvent: EVT.ConnectionStarted,
           failEvents: [EVT.ConnectionFailed],
+          timer,
         };
         ws.send(buildConnectionFrame(EVT.StartConnection));
       });
@@ -292,11 +334,11 @@ export class VolcTtsWs {
       event: EVT.StartSession,
       namespace: 'BidirectionalTTS',
       req_params: {
-        speaker: this.config.speaker || 'zh_female_cancan_mars_bigtts',
+        speaker: this.config.speaker,
         audio_params: {
-          format: this.config.format || 'mp3',
-          sample_rate: this.config.sampleRate || 24000,
-          speech_rate: this.config.speechRate ?? 0,
+          format: 'mp3',
+          sample_rate: this.config.sampleRate,
+          speech_rate: this.config.speechRate,
         },
         ...(Object.keys(additions).length > 0 && {
           additions: JSON.stringify(additions),
@@ -305,16 +347,50 @@ export class VolcTtsWs {
     };
 
     return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.resolver) {
+          const r = this.resolver;
+          this.resolver = null;
+          r.reject(
+            new TtsStallError(
+              `VolcEngine startSession timed out after ${START_SESSION_TIMEOUT_MS}ms`,
+            ),
+          );
+        }
+      }, START_SESSION_TIMEOUT_MS);
+
       this.resolver = {
         resolve,
         reject,
         successEvent: EVT.SessionStarted,
         failEvents: [EVT.SessionFailed],
+        timer,
       };
       this.ws!.send(
         buildSessionFrame(EVT.StartSession, this.sessionId!, payload),
       );
     });
+  }
+
+  private armStallWatchdog(): void {
+    this.clearStallWatchdog();
+    this.stallTimer = setTimeout(() => {
+      const cb = this.callbacks;
+      this.sessionId = null;
+      this.callbacks = null;
+      cb?.onError(
+        new TtsStallError(
+          `VolcEngine TTS stalled: no audio within ${AUDIO_STALL_TIMEOUT_MS}ms`,
+        ),
+      );
+    }, AUDIO_STALL_TIMEOUT_MS);
+  }
+
+  private clearStallWatchdog(): void {
+    if (this.stallTimer) {
+      clearTimeout(this.stallTimer);
+      this.stallTimer = null;
+    }
   }
 
   /**
@@ -330,6 +406,7 @@ export class VolcTtsWs {
         req_params: { text },
       }),
     );
+    this.armStallWatchdog();
   }
 
   /**
@@ -342,6 +419,7 @@ export class VolcTtsWs {
     this.ws.send(
       buildSessionFrame(EVT.FinishSession, this.sessionId, {}),
     );
+    this.armStallWatchdog();
   }
 
   /**
@@ -355,6 +433,7 @@ export class VolcTtsWs {
     );
     this.sessionId = null;
     this.callbacks = null;
+    this.clearStallWatchdog();
   }
 
   /**
@@ -372,7 +451,9 @@ export class VolcTtsWs {
     this.ws = null;
     this.sessionId = null;
     this.callbacks = null;
+    if (this.resolver?.timer) clearTimeout(this.resolver.timer);
     this.resolver = null;
+    this.clearStallWatchdog();
   }
 
   get isConnected(): boolean {
@@ -393,6 +474,7 @@ export class VolcTtsWs {
       if (frame.event === this.resolver.successEvent) {
         const r = this.resolver;
         this.resolver = null;
+        if (r.timer) clearTimeout(r.timer);
         r.resolve();
         return;
       }
@@ -403,6 +485,7 @@ export class VolcTtsWs {
       ) {
         const r = this.resolver;
         this.resolver = null;
+        if (r.timer) clearTimeout(r.timer);
         r.reject(new Error(this.extractErrorMessage(frame)));
         return;
       }
@@ -410,12 +493,14 @@ export class VolcTtsWs {
 
     // Audio chunk
     if (frame.event === EVT.TTSResponse && frame.payload) {
+      this.clearStallWatchdog();
       this.callbacks?.onAudio(Buffer.from(frame.payload));
       return;
     }
 
     // Session finished normally
     if (frame.event === EVT.SessionFinished) {
+      this.clearStallWatchdog();
       const cb = this.callbacks;
       this.sessionId = null;
       this.callbacks = null;
@@ -425,6 +510,7 @@ export class VolcTtsWs {
 
     // Session failed
     if (frame.event === EVT.SessionFailed) {
+      this.clearStallWatchdog();
       const cb = this.callbacks;
       this.sessionId = null;
       this.callbacks = null;
@@ -434,6 +520,7 @@ export class VolcTtsWs {
 
     // Protocol-level error
     if (frame.msgType === MSG.Error) {
+      this.clearStallWatchdog();
       this.callbacks?.onError(new Error(this.extractErrorMessage(frame)));
       return;
     }
