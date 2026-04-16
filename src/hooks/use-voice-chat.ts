@@ -1,13 +1,23 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+
 import { AudioStreamPlayer } from '@/lib/audio-stream-player';
+import { resolveConversationRequestContext } from '@/lib/conversation-intro';
 
 export type ChatState = 'idle' | 'listening' | 'thinking' | 'speaking';
 
 export interface Message {
   role: 'user' | 'assistant';
   content: string;
+}
+
+export interface Topic {
+  id: string;
+  name: string;
+  icon: string;
+  systemPrompt: string;
+  isCustom: boolean;
 }
 
 const INTERRUPT_VOLUME_THRESHOLD = 0.25;
@@ -49,6 +59,10 @@ export function useVoiceChat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [interimText, setInterimText] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
+  const [topicId, setTopicId] = useState<string | null>(null);
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [topics, setTopics] = useState<Topic[]>([]);
+  const [currentTopic, setCurrentTopic] = useState<Topic | null>(null);
 
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -62,6 +76,8 @@ export function useVoiceChat() {
   const speakingStartedAtRef = useRef(0);
   const loudFramesRef = useRef(0);
   const chatAbortRef = useRef<AbortController | null>(null);
+  const topicIdRef = useRef<string | null>(null);
+  const conversationIdRef = useRef<string | null>(null);
 
   // Keep refs in sync
   useEffect(() => {
@@ -71,6 +87,14 @@ export function useVoiceChat() {
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  useEffect(() => {
+    topicIdRef.current = topicId;
+  }, [topicId]);
+
+  useEffect(() => {
+    conversationIdRef.current = conversationId;
+  }, [conversationId]);
 
   const stopVolumeLoop = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
@@ -146,6 +170,44 @@ export function useVoiceChat() {
   // Forward declaration ref so processTranscript can call startListeningInternal
   const startListeningInternalRef = useRef<() => void>(() => {});
 
+  const applyConversationContext = useCallback(
+    (
+      nextTopicId: string | null,
+      nextConversationId: string | null,
+      nextTopic: Topic | null,
+    ) => {
+      topicIdRef.current = nextTopicId;
+      conversationIdRef.current = nextConversationId;
+      setTopicId(nextTopicId);
+      setConversationId(nextConversationId);
+      setCurrentTopic(nextTopic);
+    },
+    [],
+  );
+
+  const beginListeningSession = useCallback(async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setErrorMessage('This browser does not support microphone capture.');
+      setState('idle');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: false,
+      });
+      mediaStreamRef.current = stream;
+      startVolumeLoop(stream);
+      startListeningInternalRef.current();
+    } catch (error) {
+      const message = getMicErrorMessage(error);
+      setErrorMessage(message);
+      alert(message);
+      setState('idle');
+    }
+  }, [startVolumeLoop]);
+
   const processTranscript = useCallback(
     async (text: string) => {
       // Don't stop recognition — keep it active for barge-in
@@ -168,10 +230,21 @@ export function useVoiceChat() {
       chatAbortRef.current = abortController;
 
       try {
+        const requestContext = resolveConversationRequestContext({
+          topicId,
+          conversationId,
+          latestTopicId: topicIdRef.current,
+          latestConversationId: conversationIdRef.current,
+        });
+
         const res = await fetch('/api/chat-voice', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: updated }),
+          body: JSON.stringify({
+            messages: updated,
+            topicId: requestContext.topicId,
+            conversationId: requestContext.conversationId,
+          }),
           signal: abortController.signal,
         });
 
@@ -234,7 +307,23 @@ export function useVoiceChat() {
               if (payload === '[DONE]') continue;
               try {
                 const evt = JSON.parse(payload);
-                if (evt.type === 'text' && evt.delta) {
+                if (evt.type === 'conversation') {
+                  const nextConversationId =
+                    typeof evt.conversationId === 'string' ? evt.conversationId : null;
+                  const nextTopicId =
+                    typeof evt.topicId === 'string' ? evt.topicId : requestContext.topicId;
+
+                  if (
+                    nextConversationId &&
+                    nextConversationId !== conversationIdRef.current
+                  ) {
+                    applyConversationContext(
+                      nextTopicId,
+                      nextConversationId,
+                      currentTopic,
+                    );
+                  }
+                } else if (evt.type === 'text' && evt.delta) {
                   fullText += evt.delta;
                   setMessages((prev) => {
                     const next = [...prev];
@@ -277,7 +366,7 @@ export function useVoiceChat() {
         }
       }
     },
-    [stopRecognition]
+    [applyConversationContext, conversationId, currentTopic, topicId]
   );
 
   const startListeningInternal = useCallback(() => {
@@ -366,32 +455,138 @@ export function useVoiceChat() {
     startListeningInternalRef.current = startListeningInternal;
   }, [startListeningInternal]);
 
-  const startChat = useCallback(async () => {
+  const startChat = useCallback(async (selectedTopic: Topic) => {
     if (stateRef.current !== 'idle') return;
     isStoppingRef.current = false;
     setErrorMessage('');
-
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setErrorMessage('This browser does not support microphone capture.');
-      setState('idle');
-      return;
-    }
+    applyConversationContext(selectedTopic.id, null, selectedTopic);
+    setMessages([]);
+    messagesRef.current = [];
+    setState('thinking');
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: false,
+      const res = await fetch('/api/conversations/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ topicId: selectedTopic.id }),
       });
-      mediaStreamRef.current = stream;
-      startVolumeLoop(stream);
-      startListeningInternal();
+
+      if (!res.ok) {
+        let serverMessage = '';
+        try {
+          const payload = await res.json();
+          if (typeof payload?.error === 'string') {
+            serverMessage = payload.error;
+          }
+        } catch {}
+
+        throw new Error(normalizeApiErrorMessage(serverMessage, res.status));
+      }
+
+      const data = await res.json();
+      const nextConversationId =
+        typeof data?.conversation?.id === 'string' ? data.conversation.id : null;
+      const introText =
+        typeof data?.introMessage?.content === 'string'
+          ? data.introMessage.content
+          : '';
+      const introAudioBase64 =
+        typeof data?.introAudioBase64 === 'string' ? data.introAudioBase64 : null;
+
+      applyConversationContext(selectedTopic.id, nextConversationId, selectedTopic);
+
+      if (introText) {
+        const introMessage: Message = { role: 'assistant', content: introText };
+        setMessages([introMessage]);
+        messagesRef.current = [introMessage];
+      }
+
+      if (introAudioBase64) {
+        let completed = false;
+        const finishIntro = () => {
+          if (completed || isStoppingRef.current) return;
+          completed = true;
+          void beginListeningSession();
+        };
+
+        const audioPlayer = new AudioStreamPlayer({
+          onPlaybackStart: () => {
+            speakingStartedAtRef.current = Date.now();
+            loudFramesRef.current = 0;
+            setState('speaking');
+          },
+          onPlaybackEnd: () => {
+            loudFramesRef.current = 0;
+            finishIntro();
+          },
+          onError: (err) => {
+            console.error('Intro playback error:', err);
+            finishIntro();
+          },
+        });
+
+        audioPlayerRef.current = audioPlayer;
+        audioPlayer.enqueueChunk(introAudioBase64);
+        audioPlayer.markFinished();
+      } else {
+        await beginListeningSession();
+      }
     } catch (error) {
-      const message = getMicErrorMessage(error);
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Unable to start the conversation.';
       setErrorMessage(message);
-      alert(message);
       setState('idle');
     }
-  }, [startVolumeLoop, startListeningInternal]);
+  }, [applyConversationContext, beginListeningSession]);
+
+  const resumeChat = useCallback(async () => {
+    if (stateRef.current !== 'idle' || !currentTopic) return;
+    isStoppingRef.current = false;
+    setErrorMessage('');
+    await beginListeningSession();
+  }, [beginListeningSession, currentTopic]);
+
+  const loadTopics = useCallback(async () => {
+    const res = await fetch('/api/topics');
+    if (res.ok) {
+      const data: Topic[] = await res.json();
+      setTopics(data);
+    }
+  }, []);
+
+  const loadConversation = useCallback(async (convId: string) => {
+    // Load conversation metadata
+    const convRes = await fetch(`/api/conversations/${convId}`);
+    if (!convRes.ok) return;
+    const conv = await convRes.json();
+
+    // Load messages
+    const msgRes = await fetch(`/api/conversations/${convId}/messages`);
+    if (!msgRes.ok) return;
+    const msgs: Message[] = await msgRes.json();
+
+    setConversationId(convId);
+    setTopicId(conv.topicId);
+    topicIdRef.current = conv.topicId;
+    conversationIdRef.current = convId;
+    setMessages(msgs);
+    messagesRef.current = msgs;
+
+    // Resolve topic for display
+    const topic = topics.find((t) => t.id === conv.topicId) ?? null;
+    if (!topic) {
+      const topicsRes = await fetch('/api/topics');
+      if (topicsRes.ok) {
+        const allTopics: Topic[] = await topicsRes.json();
+        setTopics(allTopics);
+        setCurrentTopic(allTopics.find((t) => t.id === conv.topicId) ?? null);
+      }
+    } else {
+      setCurrentTopic(topic);
+    }
+  }, [topics]);
 
   const stopChat = useCallback(() => {
     isStoppingRef.current = true;
@@ -413,6 +608,31 @@ export function useVoiceChat() {
     setErrorMessage('');
   }, [stopRecognition, stopVolumeLoop]);
 
+  const startNewChat = useCallback(() => {
+    isStoppingRef.current = true;
+    stopRecognition();
+    audioPlayerRef.current?.stopAll();
+    chatAbortRef.current?.abort();
+    chatAbortRef.current = null;
+    loudFramesRef.current = 0;
+    stopVolumeLoop();
+    audioContextRef.current?.close();
+    audioContextRef.current = null;
+    mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    mediaStreamRef.current = null;
+    setState('idle');
+    setInterimText('');
+    setErrorMessage('');
+    setTopicId(null);
+    setConversationId(null);
+    topicIdRef.current = null;
+    conversationIdRef.current = null;
+    setMessages([]);
+    messagesRef.current = [];
+    setCurrentTopic(null);
+    isStoppingRef.current = false;
+  }, [stopRecognition, stopVolumeLoop]);
+
   // Cleanup on unmount
   useEffect(() => {
     return () => {
@@ -426,5 +646,21 @@ export function useVoiceChat() {
     };
   }, [stopRecognition]);
 
-  return { state, volume, messages, interimText, errorMessage, startChat, stopChat };
+  return {
+    state,
+    volume,
+    messages,
+    interimText,
+    errorMessage,
+    topicId,
+    conversationId,
+    currentTopic,
+    topics,
+    startChat,
+    resumeChat,
+    stopChat,
+    loadTopics,
+    loadConversation,
+    startNewChat,
+  };
 }

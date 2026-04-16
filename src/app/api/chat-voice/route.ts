@@ -11,8 +11,12 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
+import { eq } from 'drizzle-orm';
 import OpenAI from 'openai';
+
+import { buildConversationTitle } from '@/lib/conversation-intro';
 import { createTtsProvider, TtsStallError } from '@/lib/tts';
+import { db, schema } from '@/db';
 
 function resolveArkBaseUrl() {
   const raw = process.env.ARK_BASE_URL?.trim();
@@ -48,11 +52,85 @@ export async function POST(req: NextRequest) {
 
     const body = await req.json();
     const messages = body?.messages;
+    const requestedTopicId = body?.topicId;
+    const requestConversationId = body?.conversationId;
+
     if (!Array.isArray(messages) || messages.length === 0) {
       return NextResponse.json(
         { error: 'Invalid request: messages must be a non-empty array' },
         { status: 400 },
       );
+    }
+
+    const [conversation] = requestConversationId
+      ? db
+          .select()
+          .from(schema.conversations)
+          .where(eq(schema.conversations.id, requestConversationId))
+          .all()
+      : [];
+
+    if (requestConversationId && !conversation) {
+      return NextResponse.json(
+        { error: 'Conversation not found' },
+        { status: 404 },
+      );
+    }
+
+    const activeTopicId = requestedTopicId ?? conversation?.topicId ?? null;
+
+    // Resolve system prompt from topic, or fall back to default
+    let systemPrompt =
+      'You are a voice assistant. Your responses will be spoken aloud, so keep them SHORT — 1 to 3 sentences max. Answer directly without preamble, lists, or elaboration. If the topic is complex, give the core answer first and offer to explain more. Respond in the same language the user speaks in.';
+    let topicName = 'Conversation';
+
+    if (activeTopicId) {
+      const [topic] = db
+        .select()
+        .from(schema.topics)
+        .where(eq(schema.topics.id, activeTopicId))
+        .all();
+      if (topic) {
+        systemPrompt = topic.systemPrompt;
+        topicName = topic.name;
+      }
+    }
+
+    // Auto-create conversation if none provided
+    let conversationId = requestConversationId;
+    if (!conversationId) {
+      conversationId = `conv-${Date.now()}`;
+      db.insert(schema.conversations)
+        .values({
+          id: conversationId,
+          topicId: activeTopicId || 'custom',
+          title: buildConversationTitle({
+            id: activeTopicId || 'custom',
+            name: topicName,
+          }),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .run();
+    }
+
+    const lastUser = [...messages].reverse().find((m) => m?.role === 'user');
+    const lastUserText: string =
+      typeof lastUser?.content === 'string' ? lastUser.content : '';
+    if (conversationId && lastUserText.trim()) {
+      db.insert(schema.messages)
+        .values({
+          id: `msg-${Date.now()}-user`,
+          conversationId,
+          role: 'user',
+          content: lastUserText,
+          createdAt: new Date(),
+        })
+        .run();
+      db.update(schema.conversations)
+        .set({ updatedAt: new Date() })
+        .where(eq(schema.conversations.id, conversationId))
+        .run();
     }
 
     const client = new OpenAI({
@@ -63,9 +141,6 @@ export async function POST(req: NextRequest) {
     const encoder = new TextEncoder();
 
     const t0 = Date.now();
-    const lastUser = [...messages].reverse().find((m) => m?.role === 'user');
-    const lastUserText: string =
-      typeof lastUser?.content === 'string' ? lastUser.content : '';
     const turnId = Math.random().toString(36).slice(2, 10);
 
     const readable = new ReadableStream({
@@ -87,6 +162,8 @@ export async function POST(req: NextRequest) {
         let logged = false;
         let ttsFailed = false;
         let ttsFailReason: string | null = null;
+        let assistantText = '';
+        let assistantPersisted = false;
         const logTurn = (outcome: string, extra?: Record<string, unknown>) => {
           if (logged) return;
           logged = true;
@@ -156,6 +233,33 @@ export async function POST(req: NextRequest) {
           }
         };
 
+        const persistAssistantIfNeeded = () => {
+          if (
+            assistantPersisted ||
+            !conversationId ||
+            !assistantText.trim()
+          ) {
+            return;
+          }
+
+          db.insert(schema.messages)
+            .values({
+              id: `msg-${Date.now()}-assistant`,
+              conversationId,
+              role: 'assistant',
+              content: assistantText,
+              createdAt: new Date(),
+            })
+            .run();
+
+          db.update(schema.conversations)
+            .set({ updatedAt: new Date() })
+            .where(eq(schema.conversations.id, conversationId))
+            .run();
+
+          assistantPersisted = true;
+        };
+
         const cleanup = () => {
           if (ttsSessionActive) {
             tts.cancelSession();
@@ -166,6 +270,7 @@ export async function POST(req: NextRequest) {
 
         const finish = () => {
           if (closed) return;
+          persistAssistantIfNeeded();
           closed = true;
           enqueue('[DONE]');
           try {
@@ -179,6 +284,14 @@ export async function POST(req: NextRequest) {
         };
 
         try {
+          enqueue(
+            JSON.stringify({
+              type: 'conversation',
+              conversationId,
+              topicId: activeTopicId,
+            }),
+          );
+
           // 1. Start TTS setup and LLM stream in parallel to reduce time-to-first-token
           const ttsSetup = tts
             .connect()
@@ -241,8 +354,7 @@ export async function POST(req: NextRequest) {
             messages: [
               {
                 role: 'system',
-                content:
-                  'You are a voice assistant. Your responses will be spoken aloud, so keep them SHORT — 1 to 3 sentences max. Answer directly without preamble, lists, or elaboration. If the topic is complex, give the core answer first and offer to explain more. Respond in the same language the user speaks in.',
+                content: systemPrompt,
               },
               ...messages,
             ],
@@ -258,6 +370,7 @@ export async function POST(req: NextRequest) {
             const text = chunk.choices[0]?.delta?.content ?? '';
             if (text) {
               mark('t_llm_first_token');
+              assistantText += text;
               textCharCount += text.length;
               enqueue(JSON.stringify({ type: 'text', delta: text }));
               if (ttsReady && ttsSessionActive) {
@@ -304,6 +417,7 @@ export async function POST(req: NextRequest) {
             finish();
           }
         } catch (error) {
+          persistAssistantIfNeeded();
           console.error('chat-voice error:', error);
           if (!closed) {
             const message =

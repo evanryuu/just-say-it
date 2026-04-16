@@ -195,7 +195,7 @@ In `AudioStreamPlayer`:
 
 **Goal:** Let users choose conversation topics with tailored system prompts, and persist all conversations for progress tracking over time.
 
-**Status:** Not started
+**Status:** In progress
 
 ### Scope
 
@@ -203,7 +203,15 @@ In `AudioStreamPlayer`:
 - Custom topic creation
 - Conversation storage (messages, topic, timestamps)
 - Session history browsing
+- Automatic topic-bound assistant greeting on conversation start
 - Progress analytics (vocabulary range, fluency metrics, LLM-evaluated scoring)
+
+### Current status
+
+- Topic/topic-history UI and SQLite-backed topic + conversation APIs are in progress
+- New conversations now bootstrap with a persisted assistant greeting tied to the selected topic
+- The client now sends the active `topicId`/`conversationId` reliably instead of falling back to `null`
+- Remaining follow-up work: broaden persistence coverage, polish analytics, and add deeper automated coverage around the route layer
 
 ### Key decisions to make
 

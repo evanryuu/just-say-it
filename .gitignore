@@ -12,6 +12,7 @@
 
 # testing
 /coverage
+/.test-dist
 
 # next.js
 /.next/
@@ -23,6 +24,8 @@
 # misc
 .DS_Store
 *.pem
+*.db
+local.db
 
 # debug
 npm-debug.log*
